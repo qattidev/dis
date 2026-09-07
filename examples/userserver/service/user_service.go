@@ -11,28 +11,40 @@ import (
 // UserService provides user-oriented application operations.
 type UserService struct {
 	repository repository.UserRepository
+	config     Config
 }
 
-// NewUserService creates a service around repository.
-func NewUserService(repository repository.UserRepository) *UserService {
-	return &UserService{repository: repository}
+// Config configures UserService at application startup.
+type Config struct {
+	// MaxUsers caps the number of users returned by ListUsers. A non-positive
+	// value leaves the result unlimited.
+	MaxUsers int
 }
 
-func init() {
-	// The repository package is imported above, so its init function registers
-	// the UserRepository before this factory is registered.
+// NewUserService creates a service around repository using config.
+func NewUserService(repository repository.UserRepository, config Config) *UserService {
+	return &UserService{repository: repository, config: config}
+}
+
+// Register adds the configured UserService factory to the default container.
+// Call it during application startup before dis.Seal.
+func Register(config Config) {
 	dis.MustRegisterFactory[*UserService](func(resolver dis.Resolver) (*UserService, error) {
 		repository, err := dis.GetServiceFrom[repository.UserRepository](resolver)
 		if err != nil {
 			return nil, fmt.Errorf("resolve user repository: %w", err)
 		}
-		return NewUserService(repository), nil
+		return NewUserService(repository, config), nil
 	})
 }
 
-// ListUsers returns all known users.
+// ListUsers returns the configured maximum number of known users.
 func (s *UserService) ListUsers() []repository.User {
-	return s.repository.List()
+	users := s.repository.List()
+	if s.config.MaxUsers > 0 && len(users) > s.config.MaxUsers {
+		return users[:s.config.MaxUsers]
+	}
+	return users
 }
 
 // GetUser returns one user by ID.

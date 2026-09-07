@@ -22,8 +22,9 @@ type errorResponse struct {
 }
 
 func main() {
-	// All package init registrations are now complete. Lock the registry before
-	// resolving the service graph and accepting requests.
+	// Compose the application with startup configuration before locking the
+	// registry and resolving the service graph.
+	service.Register(service.Config{MaxUsers: 2})
 	dis.Seal()
 	userService, err := dis.GetService[*service.UserService]()
 	if err != nil {

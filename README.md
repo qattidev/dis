@@ -90,8 +90,12 @@ singletons.
 
 The [`examples/userserver`](examples/userserver) application shows a
 repository registered from one package's `init()` function, a `UserService`
-created by a resolver-backed factory in another package, and HTTP handlers
-that receive the resolved singleton at startup.
+created by a resolver-backed factory with startup configuration, and HTTP
+handlers that receive the resolved singleton at startup. Its composition root
+passes `service.Config{MaxUsers: 2}` to `service.Register` before `dis.Seal()`;
+the factory supplies that config to `NewUserService` alongside the resolved
+repository. A positive `MaxUsers` value caps the users returned by `GET
+/users`; zero or a negative value leaves the list unlimited.
 
 ```sh
 go run ./examples/userserver
