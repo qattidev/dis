@@ -34,7 +34,8 @@ type defaultOnlyService struct{}
 
 func TestPackageLevelAPIUsesDefaultContainer(t *testing.T) {
 	if os.Getenv("DIS_TEST_DEFAULT_CONTAINER") != "1" {
-		command := exec.Command(os.Args[0], "-test.run=^TestPackageLevelAPIUsesDefaultContainer$")
+		//nolint:gosec // G204: Relaunch this test executable with fixed arguments to isolate global state.
+		command := exec.CommandContext(t.Context(), os.Args[0], "-test.run=^TestPackageLevelAPIUsesDefaultContainer$")
 		command.Env = append(os.Environ(), "DIS_TEST_DEFAULT_CONTAINER=1")
 		output, err := command.CombinedOutput()
 		if err != nil {

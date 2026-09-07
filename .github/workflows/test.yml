@@ -7,13 +7,77 @@ on:
 permissions:
   contents: read
 
+env:
+  GOTOOLCHAIN: local
+  GOLANGCI_LINT_VERSION: v2.13.2
+  GOVULNCHECK_VERSION: v1.7.0
+  ACTIONLINT_VERSION: v1.7.12
+
 jobs:
   test:
     runs-on: ubuntu-latest
+    timeout-minutes: 20
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-go@v5
+      - name: Check out source
+        id: checkout
+        uses: actions/checkout@v6
+
+      - name: Set up minimum supported Go
+        id: go_minimum
+        uses: actions/setup-go@v6
         with:
           go-version: '1.24.x'
-      - run: go vet ./...
-      - run: go test -race -shuffle=on -count=2 ./...
+          cache-dependency-path: go.mod
+
+      - name: Verify modules
+        if: ${{ !cancelled() && steps.go_minimum.outcome == 'success' }}
+        run: go mod verify
+
+      - name: Check module tidiness
+        if: ${{ !cancelled() && steps.go_minimum.outcome == 'success' }}
+        run: go mod tidy -diff
+
+      - name: Vet on minimum supported Go
+        if: ${{ !cancelled() && steps.go_minimum.outcome == 'success' }}
+        run: go vet ./...
+
+      - name: Test with race detection on minimum supported Go
+        if: ${{ !cancelled() && steps.go_minimum.outcome == 'success' }}
+        run: go test -race -shuffle=on -count=2 ./...
+
+      - name: Set up Go for analysis
+        id: go_analysis
+        if: ${{ !cancelled() && steps.checkout.outcome == 'success' }}
+        uses: actions/setup-go@v6
+        with:
+          go-version: '1.27.x'
+          cache-dependency-path: go.mod
+
+      - name: Test on analysis Go version
+        if: ${{ !cancelled() && steps.go_analysis.outcome == 'success' }}
+        run: go test ./...
+
+      - name: Analyze Go and check formatting
+        if: ${{ !cancelled() && steps.go_analysis.outcome == 'success' }}
+        uses: golangci/golangci-lint-action@v9
+        with:
+          version: ${{ env.GOLANGCI_LINT_VERSION }}
+          args: --timeout=5m ./...
+
+      - name: Install vulnerability scanner
+        id: install_govulncheck
+        if: ${{ !cancelled() && steps.go_analysis.outcome == 'success' }}
+        run: go install "golang.org/x/vuln/cmd/govulncheck@${GOVULNCHECK_VERSION}"
+
+      - name: Check vulnerabilities
+        if: ${{ !cancelled() && steps.install_govulncheck.outcome == 'success' }}
+        run: govulncheck ./...
+
+      - name: Install workflow analyzer
+        id: install_actionlint
+        if: ${{ !cancelled() && steps.go_analysis.outcome == 'success' }}
+        run: go install "github.com/rhysd/actionlint/cmd/actionlint@${ACTIONLINT_VERSION}"
+
+      - name: Analyze GitHub Actions workflows
+        if: ${{ !cancelled() && steps.install_actionlint.outcome == 'success' }}
+        run: actionlint -color

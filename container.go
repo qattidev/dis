@@ -416,6 +416,7 @@ func isNil(value any) bool {
 	}
 
 	reflected := reflect.ValueOf(value)
+	//nolint:exhaustive // Only kinds accepted by reflect.Value.IsNil belong in this case.
 	switch reflected.Kind() {
 	case reflect.Chan, reflect.Func, reflect.Interface, reflect.Map, reflect.Pointer, reflect.Slice:
 		return reflected.IsNil()
