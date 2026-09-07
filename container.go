@@ -29,6 +29,11 @@ var (
 	// ErrCircularDependency indicates that a factory requested a service already
 	// being resolved in its dependency chain.
 	ErrCircularDependency = errors.New("dis: circular dependency")
+
+	// ErrFactoryPanicked indicates that a factory panicked while constructing a
+	// service. The goroutine that invoked the factory receives the original
+	// panic; concurrent callers receive an error wrapping this sentinel.
+	ErrFactoryPanicked = errors.New("dis: factory panicked")
 )
 
 // Resolver is supplied to a Factory while it is constructing a service.
@@ -40,13 +45,17 @@ type Resolver interface {
 
 // Factory creates one service value. Its result is cached after the first
 // successful call. A returned error is not cached, so a later lookup retries
-// construction.
+// construction. If a factory panics, the caller that ran it receives that
+// panic, concurrent callers receive FactoryPanicError, and a later lookup
+// retries construction.
 type Factory[T any] func(Resolver) (T, error)
 
-// Container holds registrations and lazily-created singleton values.
-// A container must be sealed before services can be resolved.
+// Container holds registrations and lazily-created singleton values. A
+// Container must not be copied after first use. A container must be sealed
+// before services can be resolved.
 type Container struct {
 	mu       sync.RWMutex
+	waitMu   sync.Mutex
 	sealed   bool
 	services map[reflect.Type]*serviceEntry
 }
@@ -61,14 +70,20 @@ type serviceEntry struct {
 }
 
 type factoryCall struct {
-	done  chan struct{}
-	value any
-	err   error
+	done        chan struct{}
+	serviceType reflect.Type
+	value       any
+	err         error
+
+	// waitingFor is protected by Container.waitMu. A factory can resolve
+	// dependencies from multiple goroutines, so each active wait is retained.
+	waitingFor map[*factoryCall]struct{}
 }
 
 type resolution struct {
 	container *Container
 	path      []reflect.Type
+	call      *factoryCall
 }
 
 // ServiceNotFoundError adds the requested type to ErrServiceNotFound.
@@ -97,6 +112,19 @@ func (e *CircularDependencyError) Error() string {
 
 func (e *CircularDependencyError) Unwrap() error { return ErrCircularDependency }
 
+// FactoryPanicError identifies the service whose factory panicked. It is
+// returned to callers that were waiting for another goroutine to construct the
+// service.
+type FactoryPanicError struct {
+	Type reflect.Type
+}
+
+func (e *FactoryPanicError) Error() string {
+	return fmt.Sprintf("%s: %s", ErrFactoryPanicked, e.Type)
+}
+
+func (e *FactoryPanicError) Unwrap() error { return ErrFactoryPanicked }
+
 var defaultContainer = NewContainer()
 
 // DefaultContainer returns the process-wide singleton container used by the
@@ -118,7 +146,8 @@ func Seal() {
 }
 
 // Seal finalizes registrations in c. It is idempotent. Once sealed, c accepts
-// no further registrations and may resolve services concurrently.
+// no further registrations and may resolve services concurrently. Seal does
+// not construct services or validate their dependency graph.
 func (c *Container) Seal() {
 	if c == nil {
 		panic("dis: cannot seal a nil container")
@@ -245,10 +274,14 @@ func (r *resolution) resolveService(serviceType reflect.Type) (any, error) {
 	nextPath := make([]reflect.Type, len(r.path)+1)
 	copy(nextPath, r.path)
 	nextPath[len(r.path)] = serviceType
-	return r.container.resolve(serviceType, &resolution{container: r.container, path: nextPath})
+	return r.container.resolve(serviceType, &resolution{
+		container: r.container,
+		path:      nextPath,
+		call:      r.call,
+	})
 }
 
-func (c *Container) resolve(serviceType reflect.Type, resolver Resolver) (any, error) {
+func (c *Container) resolve(serviceType reflect.Type, resolver *resolution) (any, error) {
 	c.mu.RLock()
 	if !c.sealed {
 		c.mu.RUnlock()
@@ -263,7 +296,7 @@ func (c *Container) resolve(serviceType reflect.Type, resolver Resolver) (any, e
 	return entry.get(resolver, serviceType)
 }
 
-func (e *serviceEntry) get(resolver Resolver, serviceType reflect.Type) (any, error) {
+func (e *serviceEntry) get(resolver *resolution, serviceType reflect.Type) (value any, err error) {
 	e.mu.Lock()
 	if e.ready {
 		value := e.value
@@ -273,20 +306,45 @@ func (e *serviceEntry) get(resolver Resolver, serviceType reflect.Type) (any, er
 	if e.inFlight != nil {
 		call := e.inFlight
 		e.mu.Unlock()
+		if cycle := resolver.container.beginWait(resolver.call, call); cycle != nil {
+			return nil, &CircularDependencyError{Path: cycle}
+		}
 		<-call.done
+		resolver.container.endWait(resolver.call, call)
 		return call.value, call.err
 	}
 
-	call := &factoryCall{done: make(chan struct{})}
+	call := &factoryCall{done: make(chan struct{}), serviceType: serviceType}
 	e.inFlight = call
 	factory := e.factory
 	e.mu.Unlock()
 
-	value, err := factory(resolver)
+	completed := false
+	defer func() {
+		if completed {
+			e.finish(call, value, err)
+			return
+		}
+
+		// A factory panic must not strand waiters. The initiating caller receives
+		// the original panic, while callers waiting on this factory receive the
+		// typed error published here and may retry construction.
+		e.finish(call, nil, &FactoryPanicError{Type: serviceType})
+	}()
+
+	value, err = factory(&resolution{
+		container: resolver.container,
+		path:      resolver.path,
+		call:      call,
+	})
+	completed = true
 	if err != nil {
 		err = fmt.Errorf("dis: construct service %s: %w", serviceType, err)
 	}
+	return value, err
+}
 
+func (e *serviceEntry) finish(call *factoryCall, value any, err error) {
 	e.mu.Lock()
 	if err == nil {
 		e.value = value
@@ -297,8 +355,55 @@ func (e *serviceEntry) get(resolver Resolver, serviceType reflect.Type) (any, er
 	call.err = err
 	close(call.done)
 	e.mu.Unlock()
+}
 
-	return value, err
+func (c *Container) beginWait(waiter, target *factoryCall) []reflect.Type {
+	if waiter == nil {
+		return nil
+	}
+
+	c.waitMu.Lock()
+	defer c.waitMu.Unlock()
+
+	if path := c.waitPath(target, waiter, make(map[*factoryCall]struct{})); path != nil {
+		return append([]reflect.Type{waiter.serviceType}, path...)
+	}
+	if waiter.waitingFor == nil {
+		waiter.waitingFor = make(map[*factoryCall]struct{})
+	}
+	waiter.waitingFor[target] = struct{}{}
+	return nil
+}
+
+func (c *Container) endWait(waiter, target *factoryCall) {
+	if waiter == nil {
+		return
+	}
+
+	c.waitMu.Lock()
+	delete(waiter.waitingFor, target)
+	if len(waiter.waitingFor) == 0 {
+		waiter.waitingFor = nil
+	}
+	c.waitMu.Unlock()
+}
+
+func (c *Container) waitPath(from, target *factoryCall, seen map[*factoryCall]struct{}) []reflect.Type {
+	if from == target {
+		return []reflect.Type{from.serviceType}
+	}
+	if _, exists := seen[from]; exists {
+		return nil
+	}
+	seen[from] = struct{}{}
+	defer delete(seen, from)
+
+	for next := range from.waitingFor {
+		if path := c.waitPath(next, target, seen); path != nil {
+			return append([]reflect.Type{from.serviceType}, path...)
+		}
+	}
+	return nil
 }
 
 func typeOf[T any]() reflect.Type {

@@ -13,7 +13,9 @@ go get github.com/qattidev/dis
 ## Use the default container
 
 Register services during package initialization, then seal the container once
-application startup has completed.
+application startup has completed. `Seal` freezes registrations; it does not
+construct services or validate the dependency graph. Resolve required services
+at startup before accepting traffic.
 
 ```go
 package users
@@ -39,8 +41,9 @@ func main() {
 }
 ```
 
-Every type has one registration. To bind an implementation to an interface,
-provide the interface as an explicit type parameter:
+Every exact type has one registration. Pointer, concrete, and interface types
+are distinct. To bind an implementation to an interface, provide the interface
+as an explicit type parameter:
 
 ```go
 dis.MustRegisterService[UserRepository](postgresRepository)
@@ -63,14 +66,18 @@ dis.MustRegisterFactory(func(r dis.Resolver) (*UserService, error) {
 ```
 
 A successful factory result is cached. Failed construction is returned to
-current callers and retried by a later lookup.
+current callers and retried by a later lookup. If a factory panics, the caller
+that runs it receives the original panic; concurrent callers receive an error
+matching `ErrFactoryPanicked`, and a later lookup retries construction.
 
 ## Lifecycle and testing
 
 `GetService` returns an error before `Seal` is called. After sealing,
 registration is immutable and service resolution is safe for concurrent use.
-Invalid registrations, including duplicates, use `Must...` APIs and panic at
-startup.
+Concurrent factory dependency cycles are reported as `ErrCircularDependency`
+rather than waiting indefinitely. Registered services remain responsible for
+their own thread safety, timeouts, and cleanup. Invalid registrations,
+including duplicates, use `Must...` APIs and panic at startup.
 
 Use an isolated container for tests:
 
@@ -82,9 +89,13 @@ container.Seal()
 repository, err := dis.GetServiceFrom[*fakeRepository](container)
 ```
 
+The process-wide default container cannot be reset or copied. Prefer an
+application-owned container when a composition root needs configurable
+registrations; use fresh containers in tests.
+
 Version 1 intentionally does not support reflection auto-wiring, named
-services, runtime replacement, shutdown hooks, or service scopes other than
-singletons.
+services, runtime replacement, shutdown hooks, cancellation, or service scopes
+other than singletons.
 
 ## Runnable HTTP example
 

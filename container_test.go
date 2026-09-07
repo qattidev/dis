@@ -2,9 +2,12 @@ package dis_test
 
 import (
 	"errors"
+	"os"
+	"os/exec"
 	"sync"
 	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/qattidev/dis"
 )
@@ -30,6 +33,16 @@ type circularB struct{}
 type defaultOnlyService struct{}
 
 func TestPackageLevelAPIUsesDefaultContainer(t *testing.T) {
+	if os.Getenv("DIS_TEST_DEFAULT_CONTAINER") != "1" {
+		command := exec.Command(os.Args[0], "-test.run=^TestPackageLevelAPIUsesDefaultContainer$")
+		command.Env = append(os.Environ(), "DIS_TEST_DEFAULT_CONTAINER=1")
+		output, err := command.CombinedOutput()
+		if err != nil {
+			t.Fatalf("run isolated default-container test: %v\n%s", err, output)
+		}
+		return
+	}
+
 	expected := &defaultOnlyService{}
 	dis.MustRegisterService(expected)
 	dis.Seal()
@@ -228,6 +241,85 @@ func TestCircularFactoryDependencyIsReported(t *testing.T) {
 	}
 }
 
+func TestConcurrentCircularFactoryDependencyIsReported(t *testing.T) {
+	container := dis.NewContainer()
+	aStarted := make(chan struct{})
+	bStarted := make(chan struct{})
+	release := make(chan struct{})
+
+	dis.MustRegisterFactoryIn(container, func(resolver dis.Resolver) (*circularA, error) {
+		close(aStarted)
+		<-release
+		_, err := dis.GetServiceFrom[*circularB](resolver)
+		if err != nil {
+			return nil, err
+		}
+		return &circularA{}, nil
+	})
+	dis.MustRegisterFactoryIn(container, func(resolver dis.Resolver) (*circularB, error) {
+		close(bStarted)
+		<-release
+		_, err := dis.GetServiceFrom[*circularA](resolver)
+		if err != nil {
+			return nil, err
+		}
+		return &circularB{}, nil
+	})
+	container.Seal()
+
+	errorsFromRoots := make(chan error, 2)
+	go func() {
+		_, err := dis.GetServiceFrom[*circularA](container)
+		errorsFromRoots <- err
+	}()
+	go func() {
+		_, err := dis.GetServiceFrom[*circularB](container)
+		errorsFromRoots <- err
+	}()
+
+	<-aStarted
+	<-bStarted
+	close(release)
+
+	for range 2 {
+		select {
+		case err := <-errorsFromRoots:
+			if !errors.Is(err, dis.ErrCircularDependency) {
+				t.Fatalf("concurrent cycle error = %v, want circular dependency", err)
+			}
+		case <-time.After(time.Second):
+			t.Fatal("concurrent cycle resolution deadlocked")
+		}
+	}
+}
+
+func TestPanickingFactoryReleasesTheEntryForRetry(t *testing.T) {
+	container := dis.NewContainer()
+	var calls atomic.Int32
+	dis.MustRegisterFactoryIn(container, func(dis.Resolver) (*userService, error) {
+		if calls.Add(1) == 1 {
+			panic("factory failed")
+		}
+		return &userService{name: "retried"}, nil
+	})
+	container.Seal()
+
+	assertPanics(t, func() {
+		_, _ = dis.GetServiceFrom[*userService](container)
+	})
+
+	service, err := dis.GetServiceFrom[*userService](container)
+	if err != nil {
+		t.Fatalf("retry lookup: %v", err)
+	}
+	if service.name != "retried" {
+		t.Fatalf("retried service = %#v", service)
+	}
+	if got := calls.Load(); got != 2 {
+		t.Fatalf("factory calls = %d, want 2", got)
+	}
+}
+
 func assertPanicsWith(t *testing.T, expected error, fn func()) {
 	t.Helper()
 	defer func() {
@@ -238,6 +330,16 @@ func assertPanicsWith(t *testing.T, expected error, fn func()) {
 		err, ok := value.(error)
 		if !ok || !errors.Is(err, expected) {
 			t.Fatalf("panic = %#v, want error wrapping %v", value, expected)
+		}
+	}()
+	fn()
+}
+
+func assertPanics(t *testing.T, fn func()) {
+	t.Helper()
+	defer func() {
+		if recover() == nil {
+			t.Fatal("function did not panic")
 		}
 	}()
 	fn()
